@@ -1,12 +1,9 @@
-# Camera Measurement Application — Student Guide
+# Camera Measurement Application — User Guide
 
 This application turns ordinary video into quantitative motion data. You point a
 camera (or your phone) at a moving object, calibrate so the software knows how
 your lens distorts the world, and then track the object frame-by-frame to get a
 time series of position in real-world units.
-
-It is the measurement front-end for the SDOF added-mass experiment, but the
-workflow is general: anything you can record and see can be tracked.
 
 ---
 
@@ -49,6 +46,16 @@ to drop into MATLAB, Python, or Excel.
   your phone. The app supports both paths and they share most steps.
 - Launch the app. The main window has a **Video Source** selector at the top.
   Pick the workflow that matches what you have.
+
+
+## Starting the application
+
+If you are on a Windows PC, you should be able to download and run the pre-compiled executable (see the releases section on the right). 
+
+If you are on any other operating system or the executable does not work for you, download the repository and run using python. 
+
+You will need to run 'pip install -r requirements.txt' to ensure that all dependencies are installed. Then run main.py, which is the entry point for the entire application.
+
 
 ---
 
