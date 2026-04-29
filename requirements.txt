@@ -1,0 +1,15 @@
+# Camera Tracking App — runtime dependencies
+# Install with: pip install -r requirements.txt
+#
+# Requires Python 3.10+
+# tkinter ships with the standard Python Windows installer (python.org).
+# On Linux: sudo apt install python3-tk  (or equivalent for your distro)
+#
+# Note: use opencv-contrib-python, NOT opencv-python — the contrib build
+# includes extra feature detectors used by the tracking pipeline.
+
+opencv-contrib-python>=4.8,<5
+numpy>=1.24
+Pillow>=10.0
+pyserial>=3.5
+imutils>=0.5.4
