@@ -624,13 +624,14 @@ class MainGUI:
             "intrinsics": {
                 "camera_matrix": cal.camera_matrix.tolist() if cal.camera_matrix is not None else None,
                 "distortion_coefficients": cal.distortion_coefficients.tolist() if cal.distortion_coefficients is not None else None,
-                # Lens distortion model — selects the right cv2 call at runtime
-                # ("pinhole" or "rational" → cv2.undistort, "fisheye" → cv2.fisheye.undistortImage).
-                # Optional: downstream consumers that already assume Brown-Conrady
-                # (cv2.undistort) can ignore this and the existing distortion_coefficients
-                # field stays a valid k1,k2,p1,p2[,k3[,k4..k6]] vector.
+                # Lens distortion model — selects the right cv2 call at runtime.
+                # "pinhole"/"rational" → cv2.undistort; "fisheye" → cv2.fisheye.undistortImage;
+                # "scaramuzza" → _build_scaramuzza_maps + cv2.remap (no camera_matrix/dist_coeffs).
                 "model_type": getattr(cal, 'model_type', 'pinhole'),
-                "fisheye_balance": float(getattr(cal, 'fisheye_balance', 0.0))
+                "fisheye_balance": float(getattr(cal, 'fisheye_balance', 0.0)),
+                # Scaramuzza / OCamCalib model parameters (model_type=="scaramuzza" only).
+                "scaramuzza_params": getattr(cal, 'scaramuzza_params', None),
+                "scaramuzza_fov": float(getattr(cal, 'scaramuzza_fov', 180.0)),
             },
             "extrinsics": {
                 "perspective_corrected": bool(cal.perspective_corrected),
@@ -665,10 +666,6 @@ class MainGUI:
                     else None),
                 "output_scale": float(getattr(cal, 'output_scale', 1.0))
             },
-            "opencv_usage_notes": {
-                "undistort": "cv2.undistort(image, camera_matrix, distortion_coefficients)",
-                "perspective_warp": "cv2.warpPerspective(image, perspective_matrix, (width, height))"
-            }
         }
 
         try:
@@ -716,17 +713,26 @@ class MainGUI:
 
             cm = intr.get("camera_matrix")
             dc = intr.get("distortion_coefficients")
-            if cm is None or dc is None:
+            model_type = intr.get("model_type", "rational")
+            fisheye_balance = float(intr.get("fisheye_balance", 0.0))
+            scaramuzza_params = intr.get("scaramuzza_params", None)
+            scaramuzza_fov = float(intr.get("scaramuzza_fov", 180.0))
+
+            # Scaramuzza calibrations have no camera_matrix / dist_coeffs.
+            if model_type != "scaramuzza" and (cm is None or dc is None):
                 messagebox.showerror(
                     "Import Failed",
                     "JSON is missing camera_matrix or distortion_coefficients.")
+                return
+            if model_type == "scaramuzza" and scaramuzza_params is None:
+                messagebox.showerror(
+                    "Import Failed",
+                    "JSON model_type is 'scaramuzza' but scaramuzza_params is missing.")
                 return
 
             checkerboard_size = info.get("checkerboard_size")
             image_size = info.get("image_size")
             cal_error = info.get("calibration_error_pixels")
-            model_type = intr.get("model_type", "rational")
-            fisheye_balance = float(intr.get("fisheye_balance", 0.0))
 
             if image_size is None:
                 messagebox.showerror(
@@ -737,13 +743,15 @@ class MainGUI:
             cd = self.calibration_data
             cd.reset()
             cd.set_calibration(
-                np.array(cm, dtype=np.float64),
-                np.array(dc, dtype=np.float64),
+                np.array(cm, dtype=np.float64) if cm is not None else None,
+                np.array(dc, dtype=np.float64) if dc is not None else None,
                 tuple(checkerboard_size) if checkerboard_size else None,
                 float(cal_error) if cal_error is not None else 0.0,
                 tuple(image_size),
                 model_type=model_type,
                 fisheye_balance=fisheye_balance,
+                scaramuzza_params=scaramuzza_params,
+                scaramuzza_fov=scaramuzza_fov,
             )
 
             # Scaling: prefer _native values when present, else fall back to

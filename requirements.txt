@@ -13,3 +13,11 @@ numpy>=1.24
 Pillow>=10.0
 pyserial>=3.5
 imutils>=0.5.4
+
+# py-OCamCalib is used only by the Scaramuzza/OCamCalib calibration path
+# (calibration_processor._fit_scaramuzza). Runtime undistortion does NOT
+# depend on it — corrections._build_scaramuzza_maps and the ROS service
+# both use a hand-rolled port. Pulls in scipy/matplotlib/loguru/tqdm/typer
+# transitively; if you only need the runtime app, you can omit this line
+# and the app will still run with non-Scaramuzza calibrations.
+py-OcamCalib @ git+https://github.com/jakarto3d/py-OCamCalib.git

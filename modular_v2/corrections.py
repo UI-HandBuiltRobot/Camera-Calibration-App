@@ -75,6 +75,71 @@ def apply_corrections(frame, calibration_data,
 _LENS_EXPAND_FACTOR = 2.0
 
 
+def _scaramuzza_world2cam(world_points, inverse_poly, distortion_center, stretch_matrix):
+    """3-D world rays -> fisheye image pixels (Scaramuzza forward projection).
+
+    Hand-rolled port of py-OCamCalib's Camera.world2cam_fast so the GUI and
+    the ROS service share an implementation we can verify against each other.
+    Math is identical except for an arccos clip that hardens against float
+    drift at z/||p|| = ±1 (py-OCamCalib would NaN there).
+    """
+    norms = np.linalg.norm(world_points, axis=1)
+    norms_safe = np.where(norms == 0, 1.0, norms)
+    z_norm = np.clip(world_points[:, 2] / norms_safe, -1.0, 1.0)
+    theta = np.arccos(z_norm)
+    rho = np.polyval(inverse_poly, theta)
+
+    pr = np.sqrt(world_points[:, 0] ** 2 + world_points[:, 1] ** 2)
+    pr_safe = np.where(pr == 0, np.finfo(float).eps, pr)
+    px = (world_points[:, 0] / pr_safe) * rho
+    py = (world_points[:, 1] / pr_safe) * rho
+
+    # Replicates py-OCamCalib's stretch-matrix ordering: the second line
+    # uses the already-modified px_new (equivalent to their Camera.world2cam_fast).
+    px_new = px * stretch_matrix[0, 0] + py * stretch_matrix[0, 1]
+    py_new = px_new * stretch_matrix[1, 0] + py
+    return np.column_stack((px_new + distortion_center[0],
+                            py_new + distortion_center[1]))
+
+
+def _build_scaramuzza_maps(params, fov_deg, out_w, out_h):
+    """Build cv2.remap source maps for Scaramuzza omnidirectional undistortion.
+
+    For each pixel (u, v) in an out_w × out_h perspective output image, computes
+    the corresponding source pixel in the raw fisheye frame using the Scaramuzza
+    inverse polynomial model.  Returns (mapx, mapy) as float32 arrays of shape
+    (out_h, out_w), ready for cv2.remap.
+
+    fov_deg is the horizontal field-of-view of the virtual perspective camera.
+    Smaller values crop the fisheye circle tighter; larger values include more
+    of the FOV at the cost of a wider black border.
+
+    params dict keys (py-OCamCalib JSON):
+      inverse_poly      — descending-order polynomial (np.polyfit output)
+      distortion_center — [xc, yc] principal point in the fisheye image
+      stretch_matrix    — 2×2 affine
+    """
+    inverse_poly = np.asarray(params['inverse_poly'], dtype=np.float64)
+    dc = params['distortion_center']
+    stretch = np.asarray(params['stretch_matrix'], dtype=np.float64)
+
+    # Clamp away from ≥180° where tan(90°) → ∞ makes f → 0 and collapses
+    # all output pixels to the same source point (black image).
+    fov_deg = min(float(fov_deg), 179.0)
+    f = max(out_w, out_h) / (2.0 * np.tan(np.radians(fov_deg / 2.0)))
+
+    u_out = np.arange(out_w, dtype=np.float64) - out_w / 2.0
+    v_out = np.arange(out_h, dtype=np.float64) - out_h / 2.0
+    X, Y = np.meshgrid(u_out, v_out)
+    world_points = np.column_stack((X.ravel(), Y.ravel(),
+                                    np.full(X.size, f, dtype=np.float64)))
+
+    img_pts = _scaramuzza_world2cam(world_points, inverse_poly, dc, stretch)
+    mapx = img_pts[:, 0].reshape(out_h, out_w).astype(np.float32)
+    mapy = img_pts[:, 1].reshape(out_h, out_w).astype(np.float32)
+    return mapx, mapy
+
+
 def _apply_lens(frame, calibration_data):
     """Apply lens distortion correction with an expanded output canvas.
 
@@ -92,6 +157,22 @@ def _apply_lens(frame, calibration_data):
     new_h = int(h * _LENS_EXPAND_FACTOR)
     dx = (new_w - w) // 2
     dy = (new_h - h) // 2
+
+    if getattr(calibration_data, 'model_type', 'pinhole') == 'scaramuzza':
+        params = getattr(calibration_data, 'scaramuzza_params', None)
+        if params is None:
+            return frame
+        fov = float(getattr(calibration_data, 'scaramuzza_fov', 180.0))
+        # Cache remap maps; rebuild only when resolution or FOV changes.
+        cache_key = (fov, new_w, new_h)
+        cached = getattr(calibration_data, '_scaramuzza_remap_cache', None)
+        if cached is None or cached[0] != cache_key:
+            mapx, mapy = _build_scaramuzza_maps(params, fov, new_w, new_h)
+            calibration_data._scaramuzza_remap_cache = (cache_key, mapx, mapy)
+        else:
+            _, mapx, mapy = cached
+        return cv2.remap(frame, mapx, mapy, cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
 
     if getattr(calibration_data, 'model_type', 'pinhole') == 'fisheye':
         balance = float(getattr(calibration_data, 'fisheye_balance', 0.0))

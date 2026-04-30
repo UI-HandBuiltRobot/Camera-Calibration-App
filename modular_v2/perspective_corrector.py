@@ -243,6 +243,11 @@ class PerspectiveCorrector:
         self._perspective_last_detection_time = None
         self._perspective_lock_release_seconds = 2.0
 
+        # Fisheye balance tuning runs once per perspective session, on the first
+        # successful frame capture (so the preview shows the actual scene).
+        # Reset by start_perspective_correction.
+        self._fisheye_balance_tuned = False
+
         # Completion callback
         self.completion_callback = None
 
@@ -771,6 +776,9 @@ class PerspectiveCorrector:
     
     def start_perspective_correction(self):
         """Start the perspective correction process"""
+        # Re-tune fisheye balance once per session (first frame capture).
+        self._fisheye_balance_tuned = False
+
         if self.use_camera:
             # Initialize camera with stored settings
             camera_id = self.camera_manager.selected_camera_id
@@ -883,6 +891,29 @@ class PerspectiveCorrector:
         while self.preview_running and self.cap:
             ret, frame = self.cap.read()
             if ret and frame is not None:
+                # Fire the fisheye/Scaramuzza FOV tuner once on the first
+                # frame, before rendering any undistortion. Otherwise a bad
+                # default FOV makes the preview unreadable and the user
+                # can't position the board. Tuner is modal+main-thread, so
+                # marshal via window.after and pause this loop until OK.
+                _model = getattr(self.calibration_data, 'model_type', None)
+                if _model in ('fisheye', 'scaramuzza') and not self._fisheye_balance_tuned:
+                    self._fisheye_balance_tuned = True   # set first to avoid re-entry
+                    done = threading.Event()
+
+                    def _run_tuner(raw=frame.copy()):
+                        try:
+                            if _model == 'fisheye':
+                                self._show_fisheye_balance_tuner(raw)
+                            else:
+                                self._show_scaramuzza_fov_tuner(raw)
+                        finally:
+                            done.set()
+
+                    self.window.after(0, _run_tuner)
+                    done.wait()
+                    continue   # skip this frame; next iteration uses new FOV
+
                 # Lens-only correction via the shared pipeline (handles
                 # pinhole/rational/fisheye branching and the canvas
                 # expansion in corrections._apply_lens).  skip_perspective
@@ -918,7 +949,19 @@ class PerspectiveCorrector:
         """Display the loaded static image with checkerboard detection"""
         if self.loaded_image is None:
             return
-            
+
+        # Fire the fisheye/Scaramuzza tuner before any undistortion happens.
+        # If we render first, a poorly-defaulted FOV produces an unreadable
+        # preview and the user can't reach 'Process Image' to trigger the
+        # tuner — they get stuck on "Checkerboard not detected".
+        _model = getattr(self.calibration_data, 'model_type', None)
+        if _model in ('fisheye', 'scaramuzza') and not self._fisheye_balance_tuned:
+            if _model == 'fisheye':
+                self._show_fisheye_balance_tuner(self.loaded_image)
+            else:
+                self._show_scaramuzza_fov_tuner(self.loaded_image)
+            self._fisheye_balance_tuned = True
+
         # Lens-only correction via the shared pipeline (see live-preview
         # site above for rationale).
         undistorted = apply_corrections(
@@ -983,12 +1026,384 @@ class PerspectiveCorrector:
         except Exception as e:
             print(f"Preview image update error: {e}")
             
+    # ------------------------------------------------------------------
+    # Fisheye balance tuning (model_type=="fisheye" only).
+    # Lives here, not in calibration_processor, because the meaningful
+    # preview / auto-tune signal needs the captured perspective frame.
+    # ------------------------------------------------------------------
+
+    def _render_fisheye_lens_corrected(self, frame, balance):
+        """Apply cv2.fisheye undistortion at the given balance, no canvas
+        expansion.  Mirrors what corrections._apply_lens does for fisheye
+        except for the canvas expansion (which would push the scene into a
+        small island of mostly-black pixels and make balance hard to judge).
+        Scales K for the frame resolution the same way runtime does.
+        """
+        h, w = frame.shape[:2]
+        K = self.calibration_data.get_scaled_camera_matrix((w, h))
+        D = self.calibration_data.distortion_coefficients
+        Knew = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+            K, D, (w, h), np.eye(3), balance=float(balance))
+        return cv2.fisheye.undistortImage(
+            frame, K, D=D, Knew=Knew, new_size=(w, h))
+
+    def _draw_grid_overlay(self, image, divisions=10, color=(0, 255, 255)):
+        """Overlay a divisions×divisions grid of straight lines as a visual
+        straightness reference.  Lines that cut across straight scene features
+        (wall edges, table edges) reveal residual fisheye curvature when the
+        balance is mis-tuned.  Returns a new image; does not mutate input.
+        """
+        out = image.copy()
+        h, w = out.shape[:2]
+        for i in range(1, divisions):
+            x = int(round(i * w / divisions))
+            cv2.line(out, (x, 0), (x, h - 1), color, 1, cv2.LINE_AA)
+            y = int(round(i * h / divisions))
+            cv2.line(out, (0, y), (w - 1, y), color, 1, cv2.LINE_AA)
+        return out
+
+    def _detect_corners_for_autotune(self, raw_frame):
+        """Detect checkerboard corners in the *raw* (pre-lens-correction)
+        frame so the auto-tune loss can re-project them through the fisheye
+        model at any candidate balance without re-detecting.
+
+        Returns (corners_Nx2, (cols, rows)) on success, or (None, None)
+        if no checkerboard pattern is detected.  cv2.findChessboardCorners
+        is generally robust to fisheye distortion as long as the corners
+        are visible.
+        """
+        gray = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2GRAY)
+        size, corners = self._detect_perspective_checkerboard(
+            gray, allow_lock=False)
+        if size is None or corners is None:
+            return None, None
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+                    30, 0.001)
+        corners = cv2.cornerSubPix(
+            gray, corners, (11, 11), (-1, -1), criteria)
+        return corners.reshape(-1, 2).astype(np.float64), size
+
+    def _straightness_loss(self, source_corners, board_size, image_size_wh, balance):
+        """Sum-of-squared perpendicular residuals when each row and each
+        column of the (lens-corrected) checkerboard corners is fitted with
+        a best-fit line.  Lower = the rows/columns are closer to actually
+        being straight in the corrected image, which is what we want.
+
+        Source corners are undistorted via cv2.fisheye.undistortPoints with
+        Knew computed at the candidate balance — same operation
+        corrections._apply_lens applies to the image at runtime.
+
+        image_size_wh is the (W, H) of the frame the source corners came
+        from; we scale K for it so this matches runtime behavior.
+        """
+        K = self.calibration_data.get_scaled_camera_matrix(image_size_wh)
+        D = self.calibration_data.distortion_coefficients
+        Knew = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+            K, D, image_size_wh, np.eye(3), balance=float(balance))
+        pts = source_corners.reshape(-1, 1, 2)
+        undist = cv2.fisheye.undistortPoints(
+            pts, K, D, P=Knew).reshape(-1, 2)
+        cols, rows = board_size  # board_size is (cols, rows) per OpenCV convention
+        if undist.shape[0] != cols * rows:
+            return float('inf')
+        grid = undist.reshape(rows, cols, 2)
+
+        def line_residuals(points):
+            # SVD-based total-least-squares perpendicular-distance fit.
+            if points.shape[0] < 2:
+                return 0.0
+            centered = points - points.mean(axis=0)
+            try:
+                _, _, vt = np.linalg.svd(centered, full_matrices=False)
+            except np.linalg.LinAlgError:
+                return float('inf')
+            normal = vt[-1]
+            return float(np.sum((centered @ normal) ** 2))
+
+        total = 0.0
+        for r in range(rows):
+            total += line_residuals(grid[r, :, :])
+        for c in range(cols):
+            total += line_residuals(grid[:, c, :])
+        return total
+
+    def _auto_tune_fisheye_balance(self, source_corners, board_size, image_size_wh):
+        """Golden-section search over balance ∈ [0, 1] minimising the
+        row/column straightness loss.  Returns the optimal balance.
+
+        Uses golden section (no derivatives, no scipy dependency, ~20
+        evaluations to 1e-3 precision on a unimodal function).  The loss
+        is generally well-behaved here because higher balance retains more
+        FOV but extrapolates the model into the vignette where corners
+        weren't trained, so straightness degrades smoothly with balance
+        once you're outside the calibrated region.
+        """
+        phi = (1 + 5 ** 0.5) / 2
+        invphi = 1.0 / phi
+        a, b = 0.0, 1.0
+        c = b - (b - a) * invphi
+        d = a + (b - a) * invphi
+        fc = self._straightness_loss(source_corners, board_size, image_size_wh, c)
+        fd = self._straightness_loss(source_corners, board_size, image_size_wh, d)
+        # ~20 iterations brings the bracket to ~1e-4 of the original interval.
+        for _ in range(20):
+            if fc < fd:
+                b, d, fd = d, c, fc
+                c = b - (b - a) * invphi
+                fc = self._straightness_loss(source_corners, board_size, image_size_wh, c)
+            else:
+                a, c, fc = c, d, fd
+                d = a + (b - a) * invphi
+                fd = self._straightness_loss(source_corners, board_size, image_size_wh, d)
+        return (a + b) / 2.0
+
+    def _show_fisheye_balance_tuner(self, raw_frame):
+        """Modal dialog: lens-corrected preview + grid overlay + balance
+        slider + auto-tune.  Writes the chosen balance to
+        self.calibration_data.fisheye_balance on OK.
+
+        Caller is responsible for the once-per-session gating; this method
+        always shows the dialog when invoked.  Cancel keeps whatever the
+        previously-stored balance was (default 1.0 from set_calibration).
+        """
+        # Try to pre-detect corners on the raw frame so auto-tune is enabled.
+        # Detection failure is non-fatal — manual slider still works.
+        source_corners, board_size = self._detect_corners_for_autotune(raw_frame)
+        autotune_available = source_corners is not None
+        raw_h, raw_w = raw_frame.shape[:2]
+        image_size_wh = (raw_w, raw_h)
+
+        dialog = tk.Toplevel(self.window if self.window else self.parent)
+        dialog.title("Tune Fisheye Balance")
+        dialog.geometry("980x800")
+        dialog.transient(self.window if self.window else self.parent)
+        dialog.grab_set()
+
+        main_frame = ttk.Frame(dialog, padding="12")
+        main_frame.pack(fill='both', expand=True)
+
+        ttk.Label(
+            main_frame,
+            text=("Since you picked the fisheye lens model, the undistortion "
+                  "balance needs tuning against your scene."),
+            font=('Arial', 11, 'bold'),
+        ).pack(anchor='w', pady=(0, 4))
+        ttk.Label(
+            main_frame,
+            text=("A 10×10 reference grid is overlaid in yellow.  Adjust "
+                  "balance until known-straight scene features (walls, table "
+                  "edges, the checkerboard rows) run parallel to the grid in "
+                  "the region you'll be tracking in.  Some black border at "
+                  "the corners is healthy — pushing balance higher to "
+                  "eliminate it forces the model to extrapolate into the "
+                  "vignette and produces balloon distortion."),
+            font=('Arial', 9), foreground='gray', wraplength=940, justify='left',
+        ).pack(anchor='w', pady=(0, 8))
+
+        preview_label = ttk.Label(main_frame)
+        preview_label.pack(fill='both', expand=True, pady=(0, 8))
+
+        slider_frame = ttk.Frame(main_frame)
+        slider_frame.pack(fill='x', pady=(0, 8))
+
+        ttk.Label(slider_frame, text="Balance:").pack(side='left', padx=(0, 6))
+        balance_var = tk.DoubleVar(
+            value=float(self.calibration_data.fisheye_balance))
+        balance_label = ttk.Label(
+            slider_frame, text=f"{balance_var.get():.2f}", width=5)
+        balance_label.pack(side='right')
+
+        update_state = {'pending': None, 'last_value': balance_var.get()}
+
+        def render(b):
+            try:
+                img = self._render_fisheye_lens_corrected(raw_frame, float(b))
+                img = self._draw_grid_overlay(img, divisions=10)
+                pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+                pil.thumbnail((920, 540), Image.Resampling.LANCZOS)
+                photo = ImageTk.PhotoImage(pil)
+                preview_label.configure(image=photo, text="")
+                preview_label.image = photo
+            except Exception as e:
+                print(f"Balance preview render error: {e}")
+
+        def on_slider(_=None):
+            b = balance_var.get()
+            balance_label.configure(text=f"{b:.2f}")
+            update_state['last_value'] = b
+            if update_state['pending'] is not None:
+                dialog.after_cancel(update_state['pending'])
+            update_state['pending'] = dialog.after(
+                80, lambda: render(update_state['last_value']))
+
+        ttk.Scale(
+            slider_frame, variable=balance_var, from_=0.0, to=1.0,
+            command=on_slider,
+        ).pack(side='left', fill='x', expand=True, padx=(0, 6))
+
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill='x')
+
+        result = {'ok': False}
+
+        def on_ok():
+            self.calibration_data.fisheye_balance = float(balance_var.get())
+            result['ok'] = True
+            dialog.destroy()
+
+        def on_cancel():
+            dialog.destroy()
+
+        def on_autotune():
+            if not autotune_available:
+                return
+            try:
+                opt = self._auto_tune_fisheye_balance(
+                    source_corners, board_size, image_size_wh)
+                balance_var.set(float(opt))
+                balance_label.configure(text=f"{opt:.2f}")
+                render(opt)
+            except Exception as e:
+                messagebox.showwarning(
+                    "Auto-tune failed",
+                    f"Could not auto-tune balance: {e}")
+
+        ttk.Button(button_frame, text="OK", command=on_ok).pack(side='right')
+        ttk.Button(
+            button_frame, text="Cancel", command=on_cancel,
+        ).pack(side='right', padx=(0, 6))
+        autotune_btn = ttk.Button(
+            button_frame, text="Auto-tune", command=on_autotune)
+        autotune_btn.pack(side='left')
+        if not autotune_available:
+            autotune_btn.configure(state='disabled')
+            ttk.Label(
+                button_frame,
+                text=("(checkerboard not detected in the captured frame — "
+                      "auto-tune disabled, manual slider only)"),
+                font=('Arial', 9), foreground='gray',
+            ).pack(side='left', padx=(8, 0))
+
+        render(balance_var.get())
+        dialog.wait_window()
+
+    # ------------------------------------------------------------------
+    # Scaramuzza FOV tuning (model_type=="scaramuzza" only).
+    # ------------------------------------------------------------------
+
+    def _render_scaramuzza_lens_corrected(self, frame, fov_deg):
+        """Apply Scaramuzza undistortion at the given FOV for the tuner preview.
+        Output is the same size as the input (no canvas expansion) so the
+        FOV effect is easy to judge in the dialog.
+        """
+        from .corrections import _build_scaramuzza_maps
+        h, w = frame.shape[:2]
+        params = self.calibration_data.scaramuzza_params
+        mapx, mapy = _build_scaramuzza_maps(params, float(fov_deg), w, h)
+        return cv2.remap(frame, mapx, mapy, cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+
+    def _show_scaramuzza_fov_tuner(self, raw_frame):
+        """Modal dialog: Scaramuzza-undistorted preview + grid overlay + FOV
+        slider.  Writes the chosen FOV to self.calibration_data.scaramuzza_fov
+        on OK; Cancel keeps the previously-stored value (default 180°).
+
+        FOV is the horizontal field-of-view of the virtual perspective camera.
+        Lower values crop tighter (less black border, smaller apparent FOV);
+        higher values include more of the fisheye circle.  A 10×10 reference
+        grid is overlaid in yellow — adjust until known-straight scene features
+        run parallel to the grid in the region you will be tracking in.
+        """
+        dialog = tk.Toplevel(self.window if self.window else self.parent)
+        dialog.title("Tune Scaramuzza Undistortion FOV")
+        dialog.geometry("980x800")
+        dialog.transient(self.window if self.window else self.parent)
+        dialog.grab_set()
+
+        main_frame = ttk.Frame(dialog, padding="12")
+        main_frame.pack(fill='both', expand=True)
+
+        ttk.Label(
+            main_frame,
+            text="Scaramuzza (OCamCalib) lens model — tune the undistortion FOV.",
+            font=('Arial', 11, 'bold'),
+        ).pack(anchor='w', pady=(0, 4))
+        ttk.Label(
+            main_frame,
+            text=("A 10×10 reference grid is overlaid in yellow.  Adjust the FOV "
+                  "slider until known-straight scene features (walls, table edges, "
+                  "checkerboard rows) run parallel to the grid in the region you "
+                  "will be tracking.  Lower FOV = tighter crop, less black border. "
+                  "Higher FOV = wider view, more black border at edges."),
+            font=('Arial', 9), foreground='gray', wraplength=940, justify='left',
+        ).pack(anchor='w', pady=(0, 8))
+
+        preview_label = ttk.Label(main_frame)
+        preview_label.pack(fill='both', expand=True, pady=(0, 8))
+
+        slider_frame = ttk.Frame(main_frame)
+        slider_frame.pack(fill='x', pady=(0, 8))
+
+        ttk.Label(slider_frame, text="FOV (°):").pack(side='left', padx=(0, 6))
+        fov_var = tk.DoubleVar(
+            value=float(self.calibration_data.scaramuzza_fov))
+        fov_label = ttk.Label(slider_frame, text=f"{fov_var.get():.0f}°", width=5)
+        fov_label.pack(side='right')
+
+        update_state = {'pending': None, 'last_value': fov_var.get()}
+
+        def render(fov):
+            try:
+                img = self._render_scaramuzza_lens_corrected(raw_frame, float(fov))
+                img = self._draw_grid_overlay(img, divisions=10)
+                pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+                pil.thumbnail((920, 540), Image.Resampling.LANCZOS)
+                photo = ImageTk.PhotoImage(pil)
+                preview_label.configure(image=photo, text="")
+                preview_label.image = photo
+            except Exception as exc:
+                print(f"Scaramuzza FOV preview render error: {exc}")
+
+        def on_slider(_=None):
+            fov = fov_var.get()
+            fov_label.configure(text=f"{fov:.0f}°")
+            update_state['last_value'] = fov
+            if update_state['pending'] is not None:
+                dialog.after_cancel(update_state['pending'])
+            update_state['pending'] = dialog.after(
+                80, lambda: render(update_state['last_value']))
+
+        ttk.Scale(
+            slider_frame, variable=fov_var, from_=10.0, to=170.0,
+            command=on_slider,
+        ).pack(side='left', fill='x', expand=True, padx=(0, 6))
+
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill='x')
+
+        def on_ok():
+            self.calibration_data.scaramuzza_fov = float(fov_var.get())
+            # Invalidate the remap cache so corrections rebuilds at runtime.
+            if hasattr(self.calibration_data, '_scaramuzza_remap_cache'):
+                del self.calibration_data._scaramuzza_remap_cache
+            dialog.destroy()
+
+        def on_cancel():
+            dialog.destroy()
+
+        ttk.Button(button_frame, text="OK", command=on_ok).pack(side='right')
+        ttk.Button(button_frame, text="Cancel", command=on_cancel).pack(
+            side='right', padx=(0, 6))
+
+        render(fov_var.get())
+        dialog.wait_window()
+
     def record_perspective_image(self):
         """Record image for perspective correction calculation"""
         if self.use_camera:
             if not self.cap:
                 return
-                
+
             ret, frame = self.cap.read()
             if not ret or frame is None:
                 messagebox.showerror("Error", "Failed to capture image")
@@ -999,7 +1414,18 @@ class PerspectiveCorrector:
                 messagebox.showerror("Error", "No image loaded")
                 return
             frame = self.loaded_image.copy()
-            
+
+        # Balance / FOV tuning: only judgeable against a real scene, so we
+        # run it here against the captured perspective frame.  Runs once per
+        # perspective session (_fisheye_balance_tuned reused for both models).
+        _model = getattr(self.calibration_data, 'model_type', None)
+        if _model in ('fisheye', 'scaramuzza') and not self._fisheye_balance_tuned:
+            if _model == 'fisheye':
+                self._show_fisheye_balance_tuner(frame)
+            else:
+                self._show_scaramuzza_fov_tuner(frame)
+            self._fisheye_balance_tuned = True
+
         # Lens-only correction via the shared pipeline.  The detected
         # checkerboard corners (below) will be in the *expanded* lens-
         # corrected coordinate space, and the homography calibrated from

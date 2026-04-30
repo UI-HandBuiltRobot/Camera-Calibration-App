@@ -56,19 +56,21 @@ class CalibrationData:
         self.calibration_error = None
         self.image_size = None
 
-        # Lens distortion model. The GUI only produces "rational"
-        # calibrations now (a strict superset of the 5-coef Brown-Conrady
-        # "pinhole" fit — extra k4..k6 coefficients converge near zero for
-        # low-distortion lenses), so the default reflects what new
-        # calibrations use. "pinhole" and "fisheye" remain valid values so
-        # JSONs saved before this change still load:
-        #   "pinhole"  - 5-coef Brown-Conrady (legacy)
-        #   "rational" - 8-coef Brown-Conrady (k1..k6, p1, p2)
-        #   "fisheye"  - cv2.fisheye equidistant (fitting path retained but
-        #                hidden in the GUI; runtime apply still works for
-        #                old calibrations)
-        # Runtime apply: pinhole/rational share cv2.undistort (auto-handles
-        # either D length); fisheye uses cv2.fisheye.undistortImage.
+        # Lens distortion model. The GUI exposes "rational" (default),
+        # "fisheye", and "scaramuzza" via the checkerboard-confirmation dialog.
+        # The legacy "pinhole" 5-coef value is no longer produced by new
+        # calibrations but still loads from older saved JSONs:
+        #   "pinhole"    - 5-coef Brown-Conrady (legacy)
+        #   "rational"   - 8-coef Brown-Conrady (k1..k6, p1, p2); rectilinear
+        #                  and moderate wide-angle lenses (≤~150° FOV)
+        #   "fisheye"    - cv2.fisheye equidistant; required for true fisheye
+        #                  lenses where the image circle is smaller than the
+        #                  sensor (visible black vignette)
+        #   "scaramuzza" - Scaramuzza omnidirectional polynomial (py-OCamCalib);
+        #                  most robust for true fisheye / omnidirectional lenses.
+        #                  Runtime apply uses a cv2.remap built from inverse_poly.
+        # Runtime apply: pinhole/rational → cv2.undistort; fisheye →
+        # cv2.fisheye.undistortImage; scaramuzza → _build_scaramuzza_maps+remap.
         self.model_type = "rational"
         # Fisheye-only: controls how much of the source FOV is preserved in
         # the undistorted output. 0 = max crop (no black corners), 1 = no
@@ -79,6 +81,12 @@ class CalibrationData:
         # Default 1.0 is the safe choice; users with full-coverage lenses
         # can lower it for less black border.
         self.fisheye_balance = 1.0
+        # Scaramuzza-only: horizontal FOV (degrees) of the virtual perspective
+        # camera used for undistortion. Smaller values crop the fisheye circle
+        # tighter (less black border); larger values retain more of the FOV but
+        # may show the vignette edge. Tuned interactively in the perspective step.
+        self.scaramuzza_params = None   # dict from py-OCamCalib JSON
+        self.scaramuzza_fov = 150.0
 
         # Initialize perspective correction as identity matrix (no correction)
         self.perspective_matrix = np.eye(3, dtype=np.float32)
@@ -119,8 +127,13 @@ class CalibrationData:
 
     def set_calibration(self, camera_matrix, dist_coeffs, checkerboard_size,
                         error, image_size, model_type="pinhole",
-                        fisheye_balance=0.0):
-        """Set calibration parameters"""
+                        fisheye_balance=0.0, scaramuzza_params=None,
+                        scaramuzza_fov=180.0):
+        """Set calibration parameters.
+
+        For model_type='scaramuzza', camera_matrix and dist_coeffs may be None;
+        pass scaramuzza_params (dict from py-OCamCalib JSON) instead.
+        """
         self.is_calibrated = True
         self.camera_matrix = camera_matrix
         self.distortion_coefficients = dist_coeffs
@@ -129,6 +142,8 @@ class CalibrationData:
         self.image_size = image_size
         self.model_type = model_type
         self.fisheye_balance = fisheye_balance
+        self.scaramuzza_params = scaramuzza_params
+        self.scaramuzza_fov = float(scaramuzza_fov)
 
         # Initialize perspective correction matrix as identity (no correction)
         self.perspective_matrix = np.eye(3, dtype=np.float32)
@@ -153,9 +168,10 @@ class CalibrationData:
             return "No calibration loaded"
         
         model_label = {
-            "pinhole":  "Standard (pinhole, 5 coef)",
-            "rational": "Wide-angle (rational, 8 coef)",
-            "fisheye":  "Fisheye (equidistant, 4 coef)",
+            "pinhole":    "Standard (pinhole, 5 coef)",
+            "rational":   "Wide-angle (rational, 8 coef)",
+            "fisheye":    "Fisheye (equidistant, 4 coef)",
+            "scaramuzza": "Omnidirectional (Scaramuzza / OCamCalib)",
         }.get(self.model_type, f"Unknown ({self.model_type})")
         base_info = (f"Lens model: {model_label}\n"
                     f"Calibrated with {self.checkerboard_size[0]}x{self.checkerboard_size[1]} checkerboard\n"
